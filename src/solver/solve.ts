@@ -14,8 +14,10 @@
 // PAVA blocks taking their *lower weighted median*; pins are observations with
 // weight > total finite weight, so every block containing a pin evaluates to
 // the pin value. Pins split the problem into independent segments, each solved
-// by a PAVA stack. Blocks retain their observations in value order so their
-// weighted lower medians can be selected directly after each merge.
+// by a PAVA stack. Each block keeps its observations in two leftist heaps — a
+// lower max-heap and an upper min-heap — so merges, median upkeep and member
+// concatenation are all O(log n) or better and the whole regression is
+// O(n log n).
 
 export const DAY_MS = 86_400_000;
 
@@ -48,18 +50,30 @@ export function solveWithSpan(
   return solveCore(cues, base, pins, daySpan);
 }
 
-interface Observation {
-  value: number;
-  weight: number;
-}
-
 // ---------------------------------------------------------------------------
 // PAVA blocks.
+//
+// A block's observations live in two leftist heaps: `lower` is a max-heap
+// holding the lighter half of the weight, `upper` a min-heap holding the
+// rest. The block value — the weighted lower median — always sits on lower's
+// top: cumulative weight reaches half the total inside lower, yet removing
+// lower's top element drops it below half. Melds, partition-restoring swaps
+// and the weight rebalance are O(log n) apiece, so a PAVA merge costs
+// O(log n) amortised and the whole regression runs in O(n log n).
 // ---------------------------------------------------------------------------
 
+interface HeapNode {
+  value: number;
+  weight: number;
+  left: HeapNode | null;
+  right: HeapNode | null;
+  rank: number; // leftist rank: 1 + null-path length down the right spine
+}
+
 interface Block {
-  observations: Observation[]; // ascending by value
-  median: number;
+  lower: HeapNode | null; // max-heap; its top is the block value
+  upper: HeapNode | null; // min-heap
+  lowerWeight: number;
   total: number;
   memberHead: EntryNode | null; // linked list of observations, index ascending
   memberTail: EntryNode | null;
@@ -70,45 +84,115 @@ interface EntryNode {
   next: EntryNode | null;
 }
 
+function heapNode(value: number, weight: number): HeapNode {
+  return { value, weight, left: null, right: null, rank: 1 };
+}
+
+const rankOf = (node: HeapNode | null): number =>
+  node === null ? 0 : node.rank;
+
+/** Heap order: above(x, y) holds when x belongs strictly closer to the root. */
+type HeapOrder = (x: HeapNode, y: HeapNode) => boolean;
+
+// Strict orders: with ties neither node is above the other, so meld's swap
+// test can never see-saw between two equal roots.
+const maxAbove: HeapOrder = (x, y) => x.value > y.value;
+const minAbove: HeapOrder = (x, y) => x.value < y.value;
+
+/**
+ * Meld two leftist heaps, consuming both. Only right spines are touched, so
+ * cost and recursion depth are O(log n).
+ */
+function meld(
+  a: HeapNode | null,
+  b: HeapNode | null,
+  above: HeapOrder,
+): HeapNode | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  if (above(b, a)) return meld(b, a, above);
+  a.right = meld(a.right, b, above);
+  if (rankOf(a.left) < rankOf(a.right)) {
+    const left = a.left;
+    a.left = a.right;
+    a.right = left;
+  }
+  a.rank = rankOf(a.right) + 1;
+  return a;
+}
+
+/** Detach node's heap top; node resets to a singleton ready to re-meld. */
+function detach(node: HeapNode, above: HeapOrder): HeapNode | null {
+  const rest = meld(node.left, node.right, above);
+  node.left = null;
+  node.right = null;
+  node.rank = 1;
+  return rest;
+}
+
 function singleton(index: number, value: number, weight: number): Block {
   const head: EntryNode = { index, next: null };
   return {
-    observations: [{ value, weight }],
-    median: value,
+    lower: heapNode(value, weight),
+    upper: null,
+    lowerWeight: weight,
     total: weight,
     memberHead: head,
     memberTail: head,
   };
 }
 
-/** Merge PAVA block b into a (a precedes b), retaining value order. */
-function mergeBlocks(a: Block, b: Block): Block {
-  const merged = new Array<Observation>(
-    a.observations.length + b.observations.length,
-  );
-  let ai = 0;
-  let bi = 0;
-  let out = 0;
-  while (ai < a.observations.length && bi < b.observations.length) {
-    if (a.observations[ai].value <= b.observations[bi].value) {
-      merged[out++] = a.observations[ai++];
-    } else {
-      merged[out++] = b.observations[bi++];
-    }
-  }
-  while (ai < a.observations.length) merged[out++] = a.observations[ai++];
-  while (bi < b.observations.length) merged[out++] = b.observations[bi++];
+/** Block value: the weighted lower median, kept on lower's top. */
+function blockMedian(blk: Block): number {
+  // lower always retains positive weight, so it is never empty.
+  return blk.lower!.value;
+}
 
-  a.observations = merged;
-  a.total += b.total;
-  let cumulative = 0;
-  for (const observation of merged) {
-    cumulative += observation.weight;
-    if (2 * cumulative >= a.total) {
-      a.median = observation.value;
-      break;
-    }
+/**
+ * Merge PAVA block b into a (a precedes b). The half-heaps meld in O(log n);
+ * a meld can invert the lower/upper partition and skew the weight balance,
+ * both restored here with top swaps. Every swap pairs elements from different
+ * source blocks and no element swaps twice within one merge, so a merge of
+ * sizes s <= t triggers at most s swaps — O(n log n) swaps over the whole
+ * regression by the usual smaller-half charging argument.
+ */
+function mergeBlocks(a: Block, b: Block): Block {
+  let lower = meld(a.lower, b.lower, maxAbove);
+  let upper = meld(a.upper, b.upper, minAbove);
+  let lowerWeight = a.lowerWeight + b.lowerWeight;
+  const total = a.total + b.total;
+
+  // Restore the partition: every lower value must be <= every upper value.
+  while (lower !== null && upper !== null && lower.value > upper.value) {
+    const l = lower;
+    const u = upper;
+    lower = detach(l, maxAbove);
+    upper = detach(u, minAbove);
+    lower = meld(lower, u, maxAbove); // the smaller top sinks into lower
+    upper = meld(upper, l, minAbove); // the larger top rises into upper
+    lowerWeight += u.weight - l.weight;
   }
+
+  // Rebalance weight so the weighted lower median sits on lower's top:
+  // cumulative weight reaches total / 2 inside lower, but dropping lower's
+  // top element falls below it. Moving tops preserves the partition.
+  while (lower !== null && 2 * (lowerWeight - lower.weight) >= total) {
+    const l = lower;
+    lower = detach(l, maxAbove);
+    upper = meld(upper, l, minAbove);
+    lowerWeight -= l.weight;
+  }
+  while (upper !== null && 2 * lowerWeight < total) {
+    const u = upper;
+    upper = detach(u, minAbove);
+    lower = meld(lower, u, maxAbove);
+    lowerWeight += u.weight;
+  }
+
+  a.lower = lower;
+  a.upper = upper;
+  a.lowerWeight = lowerWeight;
+  a.total = total;
   if (a.memberTail) a.memberTail.next = b.memberHead;
   else a.memberHead = b.memberHead;
   a.memberTail = b.memberTail;
@@ -143,7 +227,7 @@ function solveSegment(
     let blk = singleton(index, value, weight);
     while (stack.length > 0) {
       const top = stack[stack.length - 1];
-      if (top.median <= blk.median) break;
+      if (blockMedian(top) <= blockMedian(blk)) break;
       stack.pop();
       blk = mergeBlocks(top, blk);
     }
@@ -163,7 +247,7 @@ function solveSegment(
   const y = new Array<number>(hi - lo + 1);
   let cost = 0;
   for (const blk of stack) {
-    const value = blk.median;
+    const value = blockMedian(blk);
     let entry = blk.memberHead;
     while (entry !== null) {
       const j = entry.index;

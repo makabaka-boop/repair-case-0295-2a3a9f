@@ -451,6 +451,39 @@ describe('performance at n = 20000', () => {
     }
   });
 
+  it('solves interleaved descending runs with pins within 2 s (solver only)', () => {
+    // Descending runs whose value ranges interleave force every block merge to
+    // restore the lower/upper heap partition with bulk swaps — the pattern
+    // that maximises median-upkeep work between the pins.
+    const n = 20_000;
+    const duration = 4_000;
+    const cues: Cue[] = new Array(n);
+    const base: number[] = new Array(n);
+    const run = 500;
+    for (let i = 0; i < n; i++) {
+      const within = i % run;
+      const round = Math.floor(i / run);
+      cues[i] = { start: 0, duration, text: 'x' };
+      base[i] = duration * i + (7_000_000 - 500 * within - 13 * round);
+    }
+    const pins = new Map<number, number>();
+    for (let k = 1; k < 10; k++) {
+      pins.set(k * 2_000, duration * k * 2_000 + 4_000_000);
+    }
+
+    const t0 = performance.now();
+    const r = solve({ cues, base, pins });
+    const elapsed = performance.now() - t0;
+    expect(elapsed).toBeLessThan(2_000);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      for (const [i, v] of pins) expect(r.starts[i]).toBe(v);
+      for (let i = 1; i < n; i++) {
+        expect(r.starts[i] >= r.starts[i - 1] + duration).toBe(true);
+      }
+    }
+  });
+
   it('solves a random pinned 20000-cue case within 2 s (solver only)', () => {
     const rand = rng(7);
     const n = 20_000;
