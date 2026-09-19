@@ -14,8 +14,9 @@
 // PAVA blocks taking their *lower weighted median*; pins are observations with
 // weight > total finite weight, so every block containing a pin evaluates to
 // the pin value. Pins split the problem into independent segments, each solved
-// by a PAVA stack. Blocks retain their observations in value order so their
-// weighted lower medians can be selected directly after each merge.
+// by a PAVA stack. Each block keeps its observations in two leftist heaps
+// (lower max-heap / upper min-heap) so its weighted lower median is the lower
+// heap's top, restored after each merge in O(log n) heap operations.
 
 export const DAY_MS = 86_400_000;
 
@@ -48,19 +49,36 @@ export function solveWithSpan(
   return solveCore(cues, base, pins, daySpan);
 }
 
-interface Observation {
-  value: number;
-  weight: number;
-}
-
 // ---------------------------------------------------------------------------
 // PAVA blocks.
+//
+// A block keeps its observations in two leftist heaps so the weighted lower
+// median is always the top of the lower heap:
+//   lower: max-heap by value, holding the lighter-valued half,
+//   upper: min-heap by value, holding the rest,
+// with every lower value <= every upper value and the weight invariants
+//   2 * lowerWeight >= total,
+//   2 * (lowerWeight - top(lower).weight) < total,
+// which pin the median at top(lower).value exactly. Merging two blocks merges
+// the heaps pairwise (O(log n) each), then restores the invariants by swapping
+// misordered tops and rebalancing weights — no per-merge array copies, so a
+// full PAVA run is O(n log n) heap operations instead of O(n^2) merges.
 // ---------------------------------------------------------------------------
 
+interface HeapNode {
+  value: number;
+  weight: number;
+  npl: number; // null-path length of the subtree rooted here
+  left: HeapNode | null;
+  right: HeapNode | null;
+}
+
 interface Block {
-  observations: Observation[]; // ascending by value
-  median: number;
+  lower: HeapNode | null; // max-heap by value
+  upper: HeapNode | null; // min-heap by value
+  lowerWeight: number; // total observation weight held in `lower`
   total: number;
+  median: number; // always the lower-heap top value
   memberHead: EntryNode | null; // linked list of observations, index ascending
   memberTail: EntryNode | null;
 }
@@ -70,45 +88,107 @@ interface EntryNode {
   next: EntryNode | null;
 }
 
+function rankOf(node: HeapNode | null): number {
+  return node === null ? 0 : node.npl;
+}
+
+function heapNode(value: number, weight: number): HeapNode {
+  return { value, weight, npl: 1, left: null, right: null };
+}
+
+/** Detach a popped root so it can re-enter a heap as a fresh singleton. */
+function resetNode(node: HeapNode): HeapNode {
+  node.left = null;
+  node.right = null;
+  node.npl = 1;
+  return node;
+}
+
+/** Leftist heap merge; `keepsTop(a, b)` decides which root stays on top. */
+function mergeHeaps(
+  a: HeapNode | null,
+  b: HeapNode | null,
+  keepsTop: (x: HeapNode, y: HeapNode) => boolean,
+): HeapNode | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  let top = a;
+  let demoted = b;
+  if (!keepsTop(a, b)) {
+    top = b;
+    demoted = a;
+  }
+  top.right = mergeHeaps(top.right, demoted, keepsTop);
+  if (rankOf(top.left) < rankOf(top.right)) {
+    const swap = top.left;
+    top.left = top.right;
+    top.right = swap;
+  }
+  top.npl = rankOf(top.right) + 1;
+  return top;
+}
+
+const lowerFirst = (x: HeapNode, y: HeapNode): boolean => x.value >= y.value;
+const upperFirst = (x: HeapNode, y: HeapNode): boolean => x.value <= y.value;
+
+const mergeLower = (a: HeapNode | null, b: HeapNode | null): HeapNode | null =>
+  mergeHeaps(a, b, lowerFirst);
+const mergeUpper = (a: HeapNode | null, b: HeapNode | null): HeapNode | null =>
+  mergeHeaps(a, b, upperFirst);
+
 function singleton(index: number, value: number, weight: number): Block {
   const head: EntryNode = { index, next: null };
   return {
-    observations: [{ value, weight }],
-    median: value,
+    lower: heapNode(value, weight),
+    upper: null,
+    lowerWeight: weight,
     total: weight,
+    median: value,
     memberHead: head,
     memberTail: head,
   };
 }
 
-/** Merge PAVA block b into a (a precedes b), retaining value order. */
+/** Merge PAVA block b into a (a precedes b); the median stays on the lower top. */
 function mergeBlocks(a: Block, b: Block): Block {
-  const merged = new Array<Observation>(
-    a.observations.length + b.observations.length,
-  );
-  let ai = 0;
-  let bi = 0;
-  let out = 0;
-  while (ai < a.observations.length && bi < b.observations.length) {
-    if (a.observations[ai].value <= b.observations[bi].value) {
-      merged[out++] = a.observations[ai++];
-    } else {
-      merged[out++] = b.observations[bi++];
-    }
-  }
-  while (ai < a.observations.length) merged[out++] = a.observations[ai++];
-  while (bi < b.observations.length) merged[out++] = b.observations[bi++];
+  let lower = mergeLower(a.lower, b.lower);
+  let upper = mergeUpper(a.upper, b.upper);
+  let lowerWeight = a.lowerWeight + b.lowerWeight;
+  const total = a.total + b.total;
 
-  a.observations = merged;
-  a.total += b.total;
-  let cumulative = 0;
-  for (const observation of merged) {
-    cumulative += observation.weight;
-    if (2 * cumulative >= a.total) {
-      a.median = observation.value;
-      break;
-    }
+  // Restore value order: every lower value must be <= every upper value.
+  while (lower !== null && upper !== null && lower.value > upper.value) {
+    const loTop = lower;
+    lower = mergeLower(lower.left, lower.right);
+    const upTop = upper;
+    upper = mergeUpper(upper.left, upper.right);
+    lowerWeight += upTop.weight - loTop.weight;
+    lower = mergeLower(lower, resetNode(upTop));
+    upper = mergeUpper(upper, resetNode(loTop));
   }
+
+  // Rebalance weights so the weighted lower median sits on the lower top:
+  //   2 * lowerWeight >= total and 2 * (lowerWeight - top.weight) < total.
+  while (lower !== null && 2 * (lowerWeight - lower.weight) >= total) {
+    const top = lower;
+    lower = mergeLower(lower.left, lower.right);
+    lowerWeight -= top.weight;
+    upper = mergeUpper(upper, resetNode(top));
+  }
+  while (2 * lowerWeight < total) {
+    // lowerWeight < total implies upper is non-empty.
+    const top = upper as HeapNode;
+    upper = mergeUpper(top.left, top.right);
+    lowerWeight += top.weight;
+    lower = mergeLower(lower, resetNode(top));
+  }
+
+  a.lower = lower;
+  a.upper = upper;
+  a.lowerWeight = lowerWeight;
+  a.total = total;
+  // total > 0 forces 2 * lowerWeight >= total > 0, so lower is non-empty.
+  a.median = (lower as HeapNode).value;
   if (a.memberTail) a.memberTail.next = b.memberHead;
   else a.memberHead = b.memberHead;
   a.memberTail = b.memberTail;
